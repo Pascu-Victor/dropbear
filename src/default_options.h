@@ -175,7 +175,6 @@ IMPORTANT: Some options will require "make clean" after changes */
    with badly seeded /dev/urandom when systems first boot. */
 #define DROPBEAR_DELAY_HOSTKEY 1
 
-
 /* Key exchange algorithm.
 
  * group14_sha1 - 2048 bit, sha1
@@ -234,7 +233,7 @@ group1 in Dropbear server too */
 
 /* Authentication Types - at least one required.
    RFC Draft requires pubkey auth, and recommends password */
-#define DROPBEAR_SVR_PASSWORD_AUTH 1
+#define DROPBEAR_SVR_PASSWORD_AUTH 0
 
 /* Note: PAM auth is quite simple and only works for PAM modules which just do
  * a simple "Login: " "Password: " (you can edit the strings in svr-authpam.c).
@@ -267,7 +266,7 @@ group1 in Dropbear server too */
 #define DROPBEAR_DEFAULT_CLI_AUTHKEY "~/.ssh/id_dropbear"
 
 /* Per client configuration file
-*/
+ */
 #define DROPBEAR_USE_SSH_CONFIG 0
 
 /* Allow specifying the password for dbclient via the DROPBEAR_PASSWORD
@@ -318,7 +317,7 @@ group1 in Dropbear server too */
  * but this limit may deter internet-wide scanning.
  *
  * If -T argument or MAX_AUTH_TRIES is larger that will be used instead.
-*/
+ */
 #define MAX_PUBKEY_QUERIES 15
 
 /* Change server process to user privileges after authentication. */
@@ -342,7 +341,6 @@ group1 in Dropbear server too */
 /* The command to invoke for xauth when using X11 forwarding.
  * "-q" for quiet */
 #define XAUTH_COMMAND "/usr/bin/xauth -q"
-
 
 /* If you want to enable running an sftp server (such as the one included with
  * OpenSSH), set the path below and set DROPBEAR_SFTPSERVER.
