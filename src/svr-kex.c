@@ -91,24 +91,25 @@ void recv_msg_kexdh_init() {
 	}
 
 	send_msg_newkeys();
-
-#if DROPBEAR_EXT_INFO
-	/* Only send it following the first newkeys */
-	if (!ses.kexstate.donesecondkex && ses.allow_ext_info) {
-		send_msg_ext_info();
-	}
-#endif
-
-	if (!ses.kexstate.donesecondkex) {
-		/* Disable other signature types.
-		 * During future rekeying, privileges may have been dropped
-		 * so other keys won't be loadable.
-		 * This must occur after send_msg_ext_info() which uses the hostkey list */
-		disable_sig_except(ses.newkeys->algo_signature);
-	}
-
 	ses.requirenext = SSH_MSG_NEWKEYS;
 	TRACE(("leave recv_msg_kexdh_init"))
+}
+
+void svr_recv_msg_newkeys() {
+	recv_msg_newkeys();
+
+	if (!ses.kexstate.donesecondkex) {
+#if DROPBEAR_EXT_INFO
+		if (ses.allow_ext_info) {
+			send_msg_ext_info();
+		}
+#endif
+
+		/* Disable other signature types after any EXT_INFO packet has
+		 * advertised the full list. During future rekeying privileges may
+		 * have been dropped, so other keys might not be loadable. */
+		disable_sig_except(ses.keys->algo_signature);
+	}
 }
 
 

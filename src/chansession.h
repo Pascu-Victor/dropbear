@@ -40,6 +40,7 @@ struct exitinfo {
 struct ChanSess {
 
 	char * cmd; /* command to exec */
+	int cmd_is_sftp_subsystem;
 	pid_t pid; /* child process pid */
 	/* command that was sent by the client, if authorized_keys command= or
 	dropbear -c was used */

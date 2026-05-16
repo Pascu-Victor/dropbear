@@ -36,6 +36,10 @@
 #include "runopts.h"
 #include "netio.h"
 
+#ifdef __WOS__
+#define WOS_WRITEQUEUE_SOFT_LIMIT (4u * 1024u * 1024u)
+#endif
+
 static void checktimeouts(void);
 static long select_timeout(void);
 static int ident_readln(int fd, char* buf, int count);
@@ -165,7 +169,13 @@ void session_loop(void(*loophandler)(void)) {
 
 	/* main loop, select()s for all sockets in use */
 	for(;;) {
-		const int writequeue_has_space = (ses.writequeue_len <= 2*TRANS_MAX_PAYLOAD_LEN);
+#ifdef __WOS__
+		const unsigned int writequeue_soft_limit =
+			MAX(WOS_WRITEQUEUE_SOFT_LIMIT, 2u * TRANS_MAX_PAYLOAD_LEN);
+#else
+		const unsigned int writequeue_soft_limit = 2u * TRANS_MAX_PAYLOAD_LEN;
+#endif
+		const int writequeue_has_space = (ses.writequeue_len <= writequeue_soft_limit);
 
 		timeout.tv_sec = select_timeout();
 		timeout.tv_usec = 0;
@@ -725,4 +735,3 @@ void update_channel_prio() {
 		ses.socket_prio = new_prio;
 	}
 }
-

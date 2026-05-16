@@ -33,6 +33,7 @@ void send_msg_kexinit(void);
 void recv_msg_kexinit(void);
 void send_msg_newkeys(void);
 void recv_msg_newkeys(void);
+void svr_recv_msg_newkeys(void);
 void kexfirstinitialise(void);
 void finish_kexhashbuf(void);
 

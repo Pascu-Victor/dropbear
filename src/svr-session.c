@@ -54,7 +54,7 @@ static const packettype svr_packettypes[] = {
 	{SSH_MSG_SERVICE_REQUEST, recv_msg_service_request}, /* server */
 	{SSH_MSG_KEXINIT, recv_msg_kexinit},
 	{SSH_MSG_KEXDH_INIT, recv_msg_kexdh_init}, /* server */
-	{SSH_MSG_NEWKEYS, recv_msg_newkeys},
+	{SSH_MSG_NEWKEYS, svr_recv_msg_newkeys},
 	{SSH_MSG_GLOBAL_REQUEST, recv_msg_global_request_remotetcp},
 	{SSH_MSG_CHANNEL_REQUEST, recv_msg_channel_request},
 	{SSH_MSG_CHANNEL_OPEN, recv_msg_channel_open},
@@ -343,7 +343,11 @@ void svr_dropbear_log(int priority, const char* format, va_list param) {
 			/* upon failure, just print the epoch-seconds time. */
 			snprintf(datestr, sizeof(datestr), "%d", (int)timesec);
 		}
+#ifdef __WOS__
+        fprintf(stderr, "[%ld] %s %s\n", getpid(), datestr, printbuf);
+#else
 		fprintf(stderr, "[%d] %s %s\n", getpid(), datestr, printbuf);
+#endif
 	}
 }
 
@@ -378,4 +382,3 @@ static void svr_algos_initialise(void) {
 		}
 	}
 }
-

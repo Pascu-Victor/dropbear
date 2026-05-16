@@ -262,6 +262,8 @@ static int newchansess(struct Channel* channel) {
 
     chansess = (struct ChanSess*)m_malloc(sizeof(struct ChanSess));
     chansess->cmd = NULL;
+    chansess->cmd_is_sftp_subsystem = 0;
+    chansess->original_command = NULL;
     chansess->connection_string = NULL;
     chansess->client_string = NULL;
     chansess->pid = 0;
@@ -699,6 +701,7 @@ static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, in
                 char* expand_path = expand_homedir_path(SFTPSERVER_PATH);
                 m_free(chansess->cmd);
                 chansess->cmd = m_strdup(expand_path);
+                chansess->cmd_is_sftp_subsystem = 1;
                 m_free(expand_path);
             } else
 #endif
@@ -717,10 +720,15 @@ static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, in
         } else {
             chansess->original_command = m_strdup("");
         }
+        chansess->cmd_is_sftp_subsystem = 0;
         chansess->cmd = m_strdup(svr_opts.forced_command);
     } else {
         /* take public key option 'command' into account */
+        char* cmd_before_pubkey_options = chansess->cmd;
         svr_pubkey_set_forced_command(chansess);
+        if (chansess->cmd != cmd_before_pubkey_options) {
+            chansess->cmd_is_sftp_subsystem = 0;
+        }
     }
 
 #if LOG_COMMANDS
@@ -1046,8 +1054,15 @@ static void execchild(const void* user_data) {
 
     pin_session_local();
 
-    usershell = m_strdup(get_user_shell());
-    run_shell_command(chansess->cmd, ses.maxfd, usershell);
+    if (chansess->cmd_is_sftp_subsystem) {
+        char* argv[2];
+        argv[0] = chansess->cmd;
+        argv[1] = NULL;
+        run_command(chansess->cmd, argv, ses.maxfd);
+    } else {
+        usershell = m_strdup(get_user_shell());
+        run_shell_command(chansess->cmd, ses.maxfd, usershell);
+    }
 
     /* only reached on error */
     dropbear_exit("Child failed");
