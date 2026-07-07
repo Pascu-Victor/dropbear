@@ -147,6 +147,10 @@ void svr_chansess_checksignal(void) {
             ex = &svr_ses.lastexit;
         }
 
+#ifdef __WOS__
+        dropbear_log(LOG_WARNING, "wos child-exit pid=%d status=0x%x matched=%d", pid, status, ex != &svr_ses.lastexit);
+#endif
+
         ex->exitpid = pid;
         if (WIFEXITED(status)) {
             ex->exitstatus = WEXITSTATUS(status);

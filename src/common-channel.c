@@ -275,6 +275,7 @@ static unsigned int write_pending(const struct Channel * channel) {
 /* EOF/close handling */
 static void check_close(struct Channel *channel) {
 	int close_allowed = 0;
+	unsigned int pending = 0;
 
 	TRACE2(("check_close: writefd %d, readfd %d, errfd %d, sent_close %d, recv_close %d",
 				channel->writefd, channel->readfd,
@@ -306,7 +307,9 @@ static void check_close(struct Channel *channel) {
 		}
 	}
 
-	if (channel->recv_close && !write_pending(channel) && close_allowed) {
+	pending = write_pending(channel);
+
+	if (channel->recv_close && !pending && close_allowed) {
 		if (!channel->sent_close) {
 			TRACE(("Sending MSG_CHANNEL_CLOSE in response to same."))
 			send_msg_channel_close(channel);
@@ -315,10 +318,16 @@ static void check_close(struct Channel *channel) {
 		return;
 	}
 
-	if ((channel->recv_eof && !write_pending(channel))
+	if ((channel->recv_eof && !pending)
 		/* have a server "session" and child has exited */
 		|| (channel->writefd != FD_UNINIT
 			&& channel->type->check_close && close_allowed)) {
+#ifdef __WOS__
+		dropbear_log(LOG_WARNING,
+			"wos channel-close-writefd idx=%u writefd=%d recv_eof=%d recv_close=%d pending=%u close_allowed=%d sent_close=%d writebuf=%u recvdone=%u recvwin=%u",
+			channel->index, channel->writefd, channel->recv_eof, channel->recv_close, pending, close_allowed, channel->sent_close,
+			channel->writebuf ? cbuf_getused(channel->writebuf) : 0, channel->recvdonelen, channel->recvwindow);
+#endif
 		close_chan_fd(channel, channel->writefd, SHUT_WR);
 	}
 
@@ -335,7 +344,7 @@ static void check_close(struct Channel *channel) {
 			&& (ERRFD_IS_WRITE(channel) || channel->errfd == FD_CLOSED)
 			&& !channel->sent_close
 			&& close_allowed
-			&& !write_pending(channel)) {
+			&& !pending) {
 		TRACE(("sending close, readfd is closed"))
 		send_msg_channel_close(channel);
 	}
@@ -598,6 +607,12 @@ void recv_msg_channel_eof() {
 	channel = getchannel_msg("EOF");
 
 	channel->recv_eof = 1;
+#ifdef __WOS__
+	dropbear_log(LOG_WARNING,
+		"wos recv-channel-eof idx=%u writefd=%d readfd=%d recv_close=%d sent_close=%d writebuf=%u recvdone=%u recvwin=%u",
+		channel->index, channel->writefd, channel->readfd, channel->recv_close, channel->sent_close,
+		channel->writebuf ? cbuf_getused(channel->writebuf) : 0, channel->recvdonelen, channel->recvwindow);
+#endif
 
 	check_close(channel);
 	TRACE(("leave recv_msg_channel_eof"))
@@ -615,6 +630,12 @@ void recv_msg_channel_close() {
 
 	channel->recv_eof = 1;
 	channel->recv_close = 1;
+#ifdef __WOS__
+	dropbear_log(LOG_WARNING,
+		"wos recv-channel-close idx=%u writefd=%d readfd=%d sent_close=%d writebuf=%u recvdone=%u recvwin=%u",
+		channel->index, channel->writefd, channel->readfd, channel->sent_close,
+		channel->writebuf ? cbuf_getused(channel->writebuf) : 0, channel->recvdonelen, channel->recvwindow);
+#endif
 
 	check_close(channel);
 	TRACE(("leave recv_msg_channel_close"))
