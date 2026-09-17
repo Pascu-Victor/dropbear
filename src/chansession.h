@@ -37,7 +37,15 @@ struct exitinfo {
 	int exitcore;
 };
 
+struct BrokerRelay;
+
 struct ChanSess {
+
+#if DROPBEAR_SVR_KEX_BROKER
+	unsigned int broker_session_id;
+	struct BrokerRelay *broker_relay;
+	char *broker_agent_path;
+#endif
 
 	char * cmd; /* command to exec */
 	int cmd_is_sftp_subsystem;
@@ -94,7 +102,20 @@ void cli_send_netcat_request(void);
 #endif
 
 void svr_chansessinitialise(void);
+void svr_exec_session_child(const void *user_data);
+void svr_exec_pty_child(struct ChanSess *chansess);
+void svr_session_pty_logout(const struct ChanSess *chansess);
+#if DROPBEAR_SVR_KEX_BROKER
+int svr_prepare_session_pty(struct ChanSess *candidate, buffer *request);
+int svr_session_window_change(const struct ChanSess *chansess, buffer *request);
+#endif
+#if !DROPBEAR_VFORK
+void svr_make_connection_string(struct ChanSess *chansess);
+#endif
 void svr_chansess_checksignal(void);
+/* Parse a complete command body using the current trusted server auth/options.
+ * The caller owns an empty candidate; no process or PTY is created here. */
+int svr_prepare_session_command(struct ChanSess *candidate, buffer *request, int iscmd, int issubsys);
 extern const struct ChanType svrchansess;
 
 struct SigMap {

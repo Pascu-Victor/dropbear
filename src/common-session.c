@@ -35,6 +35,7 @@
 #include "channel.h"
 #include "runopts.h"
 #include "netio.h"
+#include "svr-kex-broker.h"
 
 #ifdef __WOS__
 #define WOS_WRITEQUEUE_SOFT_LIMIT (4u * 1024u * 1024u)
@@ -179,6 +180,9 @@ void session_loop(void(*loophandler)(void)) {
 
 		timeout.tv_sec = select_timeout();
 		timeout.tv_usec = 0;
+#if DROPBEAR_SERVER && DROPBEAR_SVR_KEX_BROKER
+		if (ses.isserver) svr_kex_broker_timeout(&timeout);
+#endif
 		DROPBEAR_FD_ZERO(&writefd);
 		DROPBEAR_FD_ZERO(&readfd);
 
@@ -277,6 +281,9 @@ void session_loop(void(*loophandler)(void)) {
 		/* loop handler prior to channelio, in case the server loophandler closes
 		channels on process exit */
 		loophandler();
+#if DROPBEAR_SERVER && DROPBEAR_SVR_KEX_BROKER
+		if (ses.isserver) svr_kex_broker_io();
+#endif
 
 		/* process pipes etc for the channels, ses.dataallowed == 0
 		 * during rekeying ) */
@@ -316,6 +323,13 @@ void session_cleanup() {
 	/* BEWARE of changing order of functions here. */
 
 	/* Must be before extra_session_cleanup() */
+#if DROPBEAR_SERVER
+	if (ses.isserver) {
+		/* Whole-connection EOF releases broker records. Channel cleanup must
+		 * not make synchronous requests during transport failure teardown. */
+		svr_kex_broker_cleanup();
+	}
+#endif
 	chancleanup();
 
 	if (ses.extra_session_cleanup) {

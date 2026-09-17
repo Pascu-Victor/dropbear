@@ -39,6 +39,14 @@ void send_msg_userauth_success(void);
 void send_msg_userauth_banner(const buffer *msg);
 void svr_auth_password(int valid_user);
 void svr_auth_pubkey(int valid_user);
+/* Verify a complete signed userauth request against independently authorized
+ * account/key inputs and the connection's trusted session ID. key must be the
+ * decoded authorized_keyblob, with trusted security-key policy flags applied.
+ * Does not authorize a key, mutate request, or change authentication state. */
+int svr_verify_pubkey_auth(const buffer *request, unsigned int beginning,
+		const buffer *session_id, const char *username,
+		const unsigned char *authorized_keyblob, unsigned int authorized_keybloblen,
+		sign_key *key, enum signature_type sigtype);
 void svr_auth_pam(int valid_user);
 void svr_switch_user(void);
 void svr_raise_gid_utmp(void);
@@ -137,6 +145,12 @@ struct AuthState {
 	char *pw_shell;
 	char *pw_name;
 	char *pw_passwd;
+#if DROPBEAR_SVR_KEX_BROKER
+	/* Captured once by the account-policy owner; never silently truncated. */
+	int pw_groups_valid;
+	unsigned int pw_group_count;
+	gid_t pw_groups[NGROUPS_MAX];
+#endif
 #if DROPBEAR_SVR_PUBKEY_OPTIONS_BUILT
 	struct PubKeyOptions* pubkey_options;
 	char *pubkey_info;

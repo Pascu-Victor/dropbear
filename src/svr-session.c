@@ -41,6 +41,7 @@
 #include "runopts.h"
 #include "crypto_desc.h"
 #include "fuzz.h"
+#include "svr-kex-broker.h"
 
 static void svr_remoteclosed(void);
 static void svr_algos_initialise(void);
@@ -84,6 +85,7 @@ static const struct ChanType *svr_chantypes[] = {
 
 static void
 svr_session_cleanup(void) {
+	svr_kex_broker_cleanup();
 	/* free potential public key options */
 	svr_pubkey_options_cleanup();
 
@@ -197,6 +199,11 @@ void svr_session(int sock, int childpipe) {
 
 	/* start off with key exchange */
 	send_msg_kexinit();
+
+#if DROPBEAR_SVR_KEX_BROKER
+	/* Fork the retained authority and drop the network worker before input. */
+	svr_kex_broker_start();
+#endif
 
 #if DROPBEAR_FUZZ
     if (fuzz.fuzzing) {

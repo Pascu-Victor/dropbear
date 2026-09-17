@@ -35,6 +35,7 @@
 #include "auth.h"
 #include "runopts.h"
 #include "dbrandom.h"
+#include "svr-kex-broker.h"
 
 static int checkusername(const char *username, unsigned int userlen);
 
@@ -94,13 +95,19 @@ void recv_msg_userauth_request() {
 		svr_opts.banner = NULL;
 	}
 
+#if DROPBEAR_SVR_KEX_BROKER
+	if (!svr_kex_broker_is_monitor()) {
+		svr_kex_broker_authenticate();
+		return;
+	}
+#endif
 	username = buf_getstring(ses.payload, &userlen);
 	servicename = buf_getstring(ses.payload, &servicelen);
 	methodname = buf_getstring(ses.payload, &methodlen);
 
 	/* only handle 'ssh-connection' currently */
 	if (servicelen != SSH_SERVICE_CONNECTION_LEN
-			&& (strncmp(servicename, SSH_SERVICE_CONNECTION,
+			|| (memcmp(servicename, SSH_SERVICE_CONNECTION,
 					SSH_SERVICE_CONNECTION_LEN) != 0)) {
 		
 		/* TODO - disconnect here */
@@ -197,6 +204,21 @@ static int check_group_membership(gid_t check_gid, const char* username, gid_t u
 	gid_t *grouplist = NULL;
 	int match = DROPBEAR_FAILURE;
 
+#if DROPBEAR_SVR_KEX_BROKER
+	if (svr_kex_broker_is_monitor()) {
+		unsigned int group;
+		if (!ses.authstate.pw_groups_valid) {
+			return DROPBEAR_FAILURE;
+		}
+		for (group = 0; group < ses.authstate.pw_group_count; group++) {
+			if (ses.authstate.pw_groups[group] == check_gid) {
+				return DROPBEAR_SUCCESS;
+			}
+		}
+		return DROPBEAR_FAILURE;
+	}
+#endif
+
 	for (ngroups = 32; ngroups <= DROPBEAR_NGROUP_MAX; ngroups *= 2) {
 		grouplist = m_malloc(sizeof(gid_t) * ngroups);
 
@@ -292,6 +314,19 @@ static int checkusername(const char *username, unsigned int userlen) {
 	}
 
 	/* check for login restricted to certain group if desired */
+#if DROPBEAR_SVR_KEX_BROKER
+	if (svr_kex_broker_is_monitor() && !ses.authstate.pw_groups_valid) {
+		int count = NGROUPS_MAX;
+		if (getgrouplist(ses.authstate.pw_name, ses.authstate.pw_gid,
+				ses.authstate.pw_groups, &count) < 0 || count <= 0 || count > NGROUPS_MAX) {
+			ses.authstate.checkusername_failed = 1;
+			dropbear_log(LOG_WARNING, "Login group snapshot failed for '%s'", ses.authstate.pw_name);
+			return DROPBEAR_FAILURE;
+		}
+		ses.authstate.pw_group_count = count;
+		ses.authstate.pw_groups_valid = 1;
+	}
+#endif
 #ifdef HAVE_GETGROUPLIST
 	if (svr_opts.restrict_group) {
 		if (check_group_membership(svr_opts.restrict_group_gid,
@@ -379,7 +414,9 @@ void send_msg_userauth_failure(int partial, int incrfail) {
 	buf_free(typebuf);
 
 	buf_putbyte(ses.writepayload, partial ? 1 : 0);
-	encrypt_packet();
+	if (!svr_kex_broker_is_monitor()) {
+		encrypt_packet();
+	}
 
 	if (incrfail) {
 		/* The SSH_MSG_AUTH_FAILURE response is delayed to attempt to
@@ -452,20 +489,28 @@ void send_msg_userauth_success() {
 	CHECKCLEARTOWRITE();
 
 	buf_putbyte(ses.writepayload, SSH_MSG_USERAUTH_SUCCESS);
+	if (svr_kex_broker_is_monitor()) {
+		/* Retain privileged account/session authority in the broker. */
+		ses.authstate.authdone = 1;
+		return;
+	}
 	encrypt_packet();
 
 	/* authdone must be set after encrypt_packet() for 
 	 * delayed-zlib mode */
 	ses.authstate.authdone = 1;
 
-#if DROPBEAR_SVR_DROP_PRIVS
+#if DROPBEAR_SVR_DROP_PRIVS && !DROPBEAR_SVR_KEX_BROKER
 	/* Drop privileges as soon as authentication has happened. */
 	svr_switch_user();
 #endif
 	ses.connect_time = 0;
 
 
-#if DROPBEAR_SVR_DROP_PRIVS
+#if DROPBEAR_SVR_KEX_BROKER
+	/* The dedicated worker identity does not determine the login's policy. */
+	ses.allowprivport = ses.authstate.pw_uid == 0;
+#elif DROPBEAR_SVR_DROP_PRIVS
 	/* If running as the user, we can rely on the OS
 	 * to limit allowed ports */
 	ses.allowprivport = 1;
@@ -510,9 +555,17 @@ void svr_switch_user(void) {
 	/* We can only change uid/gid as root ... */
 	if (getuid() == 0) {
 
-		if ((setgid(ses.authstate.pw_gid) < 0) ||
-			(initgroups(ses.authstate.pw_name, 
-						ses.authstate.pw_gid) < 0)) {
+#if DROPBEAR_SVR_KEX_BROKER
+		if (!ses.authstate.pw_groups_valid || ses.authstate.pw_group_count == 0
+				|| ses.authstate.pw_group_count > NGROUPS_MAX) {
+			dropbear_exit("Login group snapshot missing");
+		}
+		if (setgid(ses.authstate.pw_gid) < 0 || setgroups(ses.authstate.pw_group_count,
+				ses.authstate.pw_groups) < 0) {
+#else
+		if (setgid(ses.authstate.pw_gid) < 0 || initgroups(ses.authstate.pw_name,
+				ses.authstate.pw_gid) < 0) {
+#endif
 			dropbear_exit("Error changing user group");
 		}
 

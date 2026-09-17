@@ -56,6 +56,7 @@
 /* Process a pubkey auth request */
 
 #include "includes.h"
+#include "svr-kex-broker.h"
 #include "session.h"
 #include "dbutil.h"
 #include "buffer.h"
@@ -79,6 +80,103 @@ static void send_msg_userauth_pk_ok(const char* sigalgo, unsigned int sigalgolen
 		const unsigned char* keyblob, unsigned int keybloblen);
 static int checkfileperm(char * filename);
 
+/* Bounded, non-owning reads for the independent proof envelope checks. */
+static int proof_string(buffer *view, const unsigned char **data, unsigned int *len) {
+	if (view->pos > view->len || view->len - view->pos < 4) {
+		return DROPBEAR_FAILURE;
+	}
+	*len = buf_getint(view);
+	if (*len > view->len - view->pos) {
+		return DROPBEAR_FAILURE;
+	}
+	*data = buf_getptr(view, *len);
+	buf_incrpos(view, *len);
+	return DROPBEAR_SUCCESS;
+}
+
+static int proof_string_matches(buffer *view, const unsigned char *expected,
+		unsigned int expectedlen) {
+	const unsigned char *data;
+	unsigned int len;
+	return proof_string(view, &data, &len) == DROPBEAR_SUCCESS
+		&& len == expectedlen && memcmp(data, expected, len) == 0;
+}
+
+int svr_verify_pubkey_auth(const buffer *request, unsigned int beginning,
+		const buffer *session_id, const char *username,
+		const unsigned char *authorized_keyblob, unsigned int authorized_keybloblen,
+		sign_key *key, enum signature_type sigtype) {
+	buffer view = *request;
+	buffer signature;
+	buffer *signbuf;
+	const unsigned char *data;
+	unsigned int len, signature_pos, signature_end, signed_len;
+	unsigned int trailerlen = 0;
+	int ret;
+
+	/* These bounds also make the transcript allocation arithmetic safe. */
+	if (request->len > request->size || beginning >= request->len
+			|| request->len - beginning > UINT_MAX - 4 - 64
+			|| session_id->len == 0 || session_id->len > 64
+			|| session_id->len > session_id->size
+			|| sigtype == DROPBEAR_SIGNATURE_NONE) {
+		return DROPBEAR_FAILURE;
+	}
+	buf_setpos(&view, beginning);
+	if (buf_getbyte(&view) != SSH_MSG_USERAUTH_REQUEST
+			|| !proof_string_matches(&view, (const unsigned char *)username, strlen(username))
+			|| !proof_string_matches(&view, (const unsigned char *)SSH_SERVICE_CONNECTION,
+				SSH_SERVICE_CONNECTION_LEN)
+			|| !proof_string_matches(&view, (const unsigned char *)AUTH_METHOD_PUBKEY,
+				AUTH_METHOD_PUBKEY_LEN)
+			|| view.pos == view.len || buf_getbool(&view) == 0
+			|| proof_string(&view, &data, &len) != DROPBEAR_SUCCESS
+			|| signature_type_from_name((const char *)data, len) != sigtype
+			|| !proof_string_matches(&view, authorized_keyblob, authorized_keybloblen)) {
+		return DROPBEAR_FAILURE;
+	}
+
+	signature_pos = view.pos;
+	if (proof_string(&view, &data, &len) != DROPBEAR_SUCCESS || view.pos != view.len) {
+		return DROPBEAR_FAILURE;
+	}
+	signature_end = view.pos;
+	/* Verify both string levels before invoking algorithm-specific parsers.
+	 * buf_verify() itself historically ignores the outer blob length, and
+	 * some algorithms do not advance their cursor past the signature bytes. */
+	signature = view;
+	buf_setpos(&view, signature_pos + 4);
+	if (proof_string(&view, &data, &len) != DROPBEAR_SUCCESS
+			|| signature_type_from_name((const char *)data, len) != sigtype
+			|| proof_string(&view, &data, &len) != DROPBEAR_SUCCESS) {
+		return DROPBEAR_FAILURE;
+	}
+#if DROPBEAR_SK_ECDSA
+	if (sigtype == DROPBEAR_SIGNATURE_SK_ECDSA_NISTP256) {
+		trailerlen = 5; /* flags byte followed by the signature counter */
+	}
+#endif
+#if DROPBEAR_SK_ED25519
+	if (sigtype == DROPBEAR_SIGNATURE_SK_ED25519) {
+		trailerlen = 5;
+	}
+#endif
+	if (signature_end - view.pos != trailerlen) {
+		return DROPBEAR_FAILURE;
+	}
+
+	signed_len = signature_pos - beginning;
+	signbuf = buf_new(4 + session_id->len + signed_len);
+	buf_putbufstring(signbuf, session_id);
+	buf_setpos(&view, beginning);
+	buf_putbytes(signbuf, buf_getptr(&view, signed_len), signed_len);
+	buf_setpos(signbuf, 0);
+	buf_setpos(&signature, signature_pos);
+	ret = buf_verify(&signature, key, sigtype, signbuf);
+	buf_free(signbuf);
+	return ret;
+}
+
 /* process a pubkey auth request, sending success or failure message as
  * appropriate */
 void svr_auth_pubkey(int valid_user) {
@@ -90,8 +188,6 @@ void svr_auth_pubkey(int valid_user) {
 	unsigned int keyalgolen;
 	unsigned char* keyblob = NULL;
 	unsigned int keybloblen;
-	unsigned int sign_payload_length;
-	buffer * signbuf = NULL;
 	sign_key * key = NULL;
 	char* fp = NULL;
 	enum signature_type sigtype;
@@ -205,25 +301,10 @@ void svr_auth_pubkey(int valid_user) {
 #endif /* DROPBEAR_SVR_PUBKEY_OPTIONS */
 #endif
 
-	/* create the data which has been signed - this a string containing
-	 * session_id, concatenated with the payload packet up to the signature */
-	assert(ses.payload_beginning <= ses.payload->pos);
-	sign_payload_length = ses.payload->pos - ses.payload_beginning;
-	signbuf = buf_new(ses.payload->pos + 4 + ses.session_id->len);
-	buf_putbufstring(signbuf, ses.session_id);
-
-	/* The entire contents of the payload prior. */
-	buf_setpos(ses.payload, ses.payload_beginning);
-	buf_putbytes(signbuf,
-		buf_getptr(ses.payload, sign_payload_length),
-		sign_payload_length);
-	buf_incrpos(ses.payload, sign_payload_length);
-
-	buf_setpos(signbuf, 0);
-
 	/* ... and finally verify the signature */
 	fp = sign_key_fingerprint(keyblob, keybloblen);
-	if (buf_verify(ses.payload, key, sigtype, signbuf) == DROPBEAR_SUCCESS) {
+	if (svr_verify_pubkey_auth(ses.payload, ses.payload_beginning, ses.session_id,
+			ses.authstate.username, keyblob, keybloblen, key, sigtype) == DROPBEAR_SUCCESS) {
 		if (svr_opts.multiauthmethod && (ses.authstate.authtypes & ~AUTH_TYPE_PUBKEY)) {
 			/* successful pubkey authentication, but extra auth required */
 			dropbear_log(LOG_NOTICE,
@@ -258,9 +339,6 @@ void svr_auth_pubkey(int valid_user) {
 
 out:
 	/* cleanup stuff */
-	if (signbuf) {
-		buf_free(signbuf);
-	}
 	if (sigalgo) {
 		m_free(sigalgo);
 	}
@@ -288,7 +366,9 @@ static void send_msg_userauth_pk_ok(const char* sigalgo, unsigned int sigalgolen
 	buf_putstring(ses.writepayload, sigalgo, sigalgolen);
 	buf_putstring(ses.writepayload, (const char*)keyblob, keybloblen);
 
-	encrypt_packet();
+	if (!svr_kex_broker_is_monitor()) {
+		encrypt_packet();
+	}
 	TRACE(("leave send_msg_userauth_pk_ok"))
 
 }

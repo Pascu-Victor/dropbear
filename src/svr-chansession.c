@@ -35,6 +35,7 @@
 #include "session.h"
 #include "ssh.h"
 #include "sshpty.h"
+#include "svr-kex-broker.h"
 #include "termcodes.h"
 #include "x11fwd.h"
 
@@ -69,12 +70,15 @@ static void pin_session_local(void) {
 /* Handles sessions (either shells or programs) requested by the client */
 
 static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, int iscmd, int issubsys);
+#if !DROPBEAR_SVR_KEX_BROKER
 static int sessionpty(struct ChanSess* chansess);
+#endif
 static int sessionsignal(const struct ChanSess* chansess);
 static int noptycommand(struct Channel* channel, struct ChanSess* chansess);
 static int ptycommand(struct Channel* channel, struct ChanSess* chansess);
+#if !DROPBEAR_SVR_KEX_BROKER
 static int sessionwinchange(const struct ChanSess* chansess);
-static void execchild(const void* user_data_chansess);
+#endif
 static void addchildpid(struct ChanSess* chansess, pid_t pid);
 static void sesssigchild_handler(int val);
 static void closechansess(const struct Channel* channel);
@@ -86,7 +90,7 @@ static int sesscheckclose(struct Channel* channel);
 static void send_exitsignalstatus(const struct Channel* channel);
 static void send_msg_chansess_exitstatus(const struct Channel* channel, const struct ChanSess* chansess);
 static void send_msg_chansess_exitsignal(const struct Channel* channel, const struct ChanSess* chansess);
-static void get_termmodes(const struct ChanSess* chansess);
+static int get_termmodes(const struct ChanSess* chansess, buffer* request);
 
 const struct ChanType svrchansess = {
     "session",          /* name */
@@ -126,6 +130,7 @@ void svr_chansess_checksignal(void) {
     }
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        svr_kex_broker_checkchild(pid);
         unsigned int i;
         struct exitinfo* ex = NULL;
         TRACE(("svr_chansess_checksignal : pid %d", pid))
@@ -302,8 +307,25 @@ static int newchansess(struct Channel* channel) {
 
 static struct logininfo* chansess_login_alloc(const struct ChanSess* chansess) {
     struct logininfo* li;
+#if DROPBEAR_SVR_KEX_BROKER
+    /* Accounting uses the authenticated identity, never a later passwd lookup. */
+    li = login_alloc_entry(chansess->pid, NULL, svr_ses.remotehost, chansess->tty);
+    strlcpy(li->username, ses.authstate.username, sizeof(li->username));
+    li->uid = ses.authstate.pw_uid;
+#else
     li = login_alloc_entry(chansess->pid, ses.authstate.username, svr_ses.remotehost, chansess->tty);
+#endif
     return li;
+}
+
+void svr_session_pty_logout(const struct ChanSess* chansess) {
+    struct logininfo* li;
+    if (!chansess->tty || chansess->pid <= 0) return;
+    li = chansess_login_alloc(chansess);
+    svr_raise_gid_utmp();
+    login_logout(li);
+    svr_restore_gid();
+    login_free_entry(li);
 }
 
 /* send exit status message before the channel is closed */
@@ -327,8 +349,6 @@ static void closechansess(const struct Channel* channel) {
 static void cleanupchansess(const struct Channel* channel) {
     struct ChanSess* chansess;
     unsigned int i;
-    struct logininfo* li;
-
     TRACE(("enter closechansess"))
 
     chansess = (struct ChanSess*)channel->typedata;
@@ -338,21 +358,16 @@ static void cleanupchansess(const struct Channel* channel) {
         return;
     }
 
+    svr_kex_broker_release_session(chansess);
     m_free(chansess->cmd);
     m_free(chansess->term);
     m_free(chansess->original_command);
 
     if (chansess->tty) {
-        /* write the utmp/wtmp login record */
-        li = chansess_login_alloc(chansess);
-
-        svr_raise_gid_utmp();
-        login_logout(li);
-        svr_restore_gid();
-
-        login_free_entry(li);
-
+#if !DROPBEAR_SVR_KEX_BROKER
+        svr_session_pty_logout(chansess);
         pty_release(chansess->tty);
+#endif
         m_free(chansess->tty);
     }
 
@@ -404,11 +419,19 @@ static void chansessionrequest(struct Channel* channel) {
     TRACE(("type is %s", type))
 
     if (strcmp(type, "window-change") == 0) {
+#if DROPBEAR_SVR_KEX_BROKER
+        ret = svr_kex_broker_window_change(channel, chansess);
+#else
         ret = sessionwinchange(chansess);
+#endif
     } else if (strcmp(type, "shell") == 0) {
         ret = sessioncommand(channel, chansess, 0, 0);
     } else if (strcmp(type, "pty-req") == 0) {
+#if DROPBEAR_SVR_KEX_BROKER
+        ret = svr_kex_broker_pty(channel, chansess);
+#else
         ret = sessionpty(chansess);
+#endif
     } else if (strcmp(type, "exec") == 0) {
         ret = sessioncommand(channel, chansess, 1, 0);
     } else if (strcmp(type, "subsystem") == 0) {
@@ -444,6 +467,11 @@ out:
 /* Send a signal to a session's process as requested by the client*/
 static int sessionsignal(const struct ChanSess* chansess) {
     TRACE(("sessionsignal"))
+#if DROPBEAR_SVR_KEX_BROKER
+    if (chansess->broker_relay) {
+        return svr_kex_broker_signal(chansess);
+    }
+#endif
 
     int sig = 0;
     char* signame = NULL;
@@ -492,6 +520,7 @@ static int sessionsignal(const struct ChanSess* chansess) {
 
 /* Let the process know that the window size has changed, as notified from the
  * client. Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
+#if !DROPBEAR_SVR_KEX_BROKER
 static int sessionwinchange(const struct ChanSess* chansess) {
     int termc, termr, termw, termh;
 
@@ -510,7 +539,9 @@ static int sessionwinchange(const struct ChanSess* chansess) {
     return DROPBEAR_SUCCESS;
 }
 
-static void get_termmodes(const struct ChanSess* chansess) {
+#endif
+
+static int get_termmodes(const struct ChanSess* chansess, buffer* request) {
     struct termios termio;
     unsigned char opcode;
     unsigned int value;
@@ -523,24 +554,24 @@ static void get_termmodes(const struct ChanSess* chansess) {
     /* We'll ignore errors and continue if we can't set modes.
      * We're ignoring baud rates since they seem evil */
     if (tcgetattr(chansess->master, &termio) == -1) {
-        return;
+        return DROPBEAR_FAILURE;
     }
 
-    len = buf_getint(ses.payload);
-    TRACE(("term mode str %d p->l %d p->p %d", len, ses.payload->len, ses.payload->pos));
-    if (len != ses.payload->len - ses.payload->pos) {
+    len = buf_getint(request);
+    TRACE(("term mode str %d p->l %d p->p %d", len, request->len, request->pos));
+    if (len != request->len - request->pos) {
         dropbear_exit("Bad term mode string");
     }
 
     if (len == 0) {
         TRACE(("leave get_termmodes: empty terminal modes string"))
-        return;
+        return DROPBEAR_SUCCESS;
     }
 
-    while (((opcode = buf_getbyte(ses.payload)) != 0x00) && opcode <= 159) {
+    while (((opcode = buf_getbyte(request)) != 0x00) && opcode <= 159) {
         /* must be before checking type, so that value is consumed even if
          * we don't use it */
-        value = buf_getint(ses.payload);
+        value = buf_getint(request);
 
         /* handle types of code */
         if (opcode > MAX_TERMCODE) {
@@ -591,13 +622,87 @@ static void get_termmodes(const struct ChanSess* chansess) {
     }
     if (tcsetattr(chansess->master, TCSANOW, &termio) < 0) {
         dropbear_log(LOG_INFO, "Error setting terminal attributes");
+        return DROPBEAR_FAILURE;
     }
     TRACE(("leave get_termmodes"))
+    return DROPBEAR_SUCCESS;
 }
+
+#if DROPBEAR_SVR_KEX_BROKER
+static void read_window(buffer* request, struct winsize* window) {
+    memset(window, 0, sizeof(*window));
+    window->ws_col = buf_getint(request);
+    window->ws_row = buf_getint(request);
+    window->ws_xpixel = buf_getint(request);
+    window->ws_ypixel = buf_getint(request);
+}
+
+int svr_session_window_change(const struct ChanSess* chansess, buffer* request) {
+    struct winsize window;
+    if (chansess->master < 0 || request->len - request->pos != 16) return DROPBEAR_FAILURE;
+    read_window(request, &window);
+    return ioctl(chansess->master, TIOCSWINSZ, &window) == 0 ? DROPBEAR_SUCCESS : DROPBEAR_FAILURE;
+}
+
+/* Validate the entire body before allocating a terminal or changing ownership.
+ * The caller publishes this empty candidate only after all setup succeeds. */
+int svr_prepare_session_pty(struct ChanSess* candidate, buffer* request) {
+    unsigned int termlen, modes_pos, length;
+    struct winsize window;
+    char name[65], *term;
+    if (!svr_kex_broker_is_monitor() || !svr_pubkey_allows_pty()) return DROPBEAR_FAILURE;
+    if (request->len - request->pos < 4) return DROPBEAR_FAILURE;
+    termlen = buf_getint(request);
+    if (termlen > MAX_TERM_LEN || termlen > request->len - request->pos) return DROPBEAR_FAILURE;
+    if (memchr(buf_getptr(request, termlen), 0, termlen)) return DROPBEAR_FAILURE;
+    term = m_malloc(termlen + 1);
+    memcpy(term, buf_getptr(request, termlen), termlen);
+    term[termlen] = '\0';
+    buf_incrpos(request, termlen);
+    if (request->len - request->pos < 20) goto invalid;
+    read_window(request, &window);
+    modes_pos = request->pos;
+    length = buf_getint(request);
+    if (length != request->len - request->pos) goto invalid;
+    if (length) {
+        for (;;) {
+            unsigned char opcode;
+            if (request->pos == request->len) goto invalid;
+            opcode = buf_getbyte(request);
+            /* SSH stops at END or an opcode reserved for future encodings. */
+            if (opcode == 0 || opcode >= 160) break;
+            if (request->len - request->pos < 4) goto invalid;
+            buf_incrpos(request, 4);
+        }
+    }
+    if (!pty_allocate(&candidate->master, &candidate->slave, name, sizeof(name))) goto invalid;
+    if (candidate->master >= FD_SETSIZE || candidate->slave >= FD_SETSIZE
+            || fcntl(candidate->master, F_SETFD, FD_CLOEXEC) < 0
+            || fcntl(candidate->slave, F_SETFD, FD_CLOEXEC) < 0) goto allocated_failure;
+    ses.maxfd = MAX(ses.maxfd, MAX(candidate->master, candidate->slave));
+    if (fchown(candidate->slave, ses.authstate.pw_uid, ses.authstate.pw_gid) < 0
+            || fchmod(candidate->slave, 0600) < 0
+            || ioctl(candidate->master, TIOCSWINSZ, &window) < 0) goto allocated_failure;
+    buf_setpos(request, modes_pos);
+    if (get_termmodes(candidate, request) != DROPBEAR_SUCCESS) goto allocated_failure;
+    candidate->term = term;
+    candidate->tty = m_strdup(name);
+    return DROPBEAR_SUCCESS;
+
+allocated_failure:
+    close(candidate->slave);
+    close(candidate->master);
+    candidate->slave = candidate->master = -1;
+invalid:
+    m_free(term);
+    return DROPBEAR_FAILURE;
+}
+#endif
 
 /* Set up a session pty which will be used to execute the shell or program.
  * The pty is allocated now, and kept for when the shell/program executes.
  * Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
+#if !DROPBEAR_SVR_KEX_BROKER
 static int sessionpty(struct ChanSess* chansess) {
     unsigned int termlen;
     char namebuf[65];
@@ -631,22 +736,31 @@ static int sessionpty(struct ChanSess* chansess) {
         dropbear_exit("Out of memory"); /* TODO disconnect */
     }
 
+#if DROPBEAR_SVR_KEX_BROKER
+    struct passwd retained = {0};
+    retained.pw_uid = ses.authstate.pw_uid;
+    retained.pw_gid = ses.authstate.pw_gid;
+    pw = &retained;
+#else
     pw = getpwnam(ses.authstate.pw_name);
     if (!pw) dropbear_exit("getpwnam failed after succeeding previously");
+#endif
     pty_setowner(pw, chansess->tty);
 
     /* Set up the rows/col counts */
     sessionwinchange(chansess);
 
     /* Read the terminal modes */
-    get_termmodes(chansess);
+    (void)get_termmodes(chansess, ses.payload);
 
     TRACE(("leave sessionpty"))
     return DROPBEAR_SUCCESS;
 }
 
+#endif
+
 #if !DROPBEAR_VFORK
-static void make_connection_string(struct ChanSess* chansess) {
+void svr_make_connection_string(struct ChanSess* chansess) {
     char *local_ip, *local_port, *remote_ip, *remote_port;
     size_t len;
     get_socket_address(ses.sock_in, &local_ip, &local_port, &remote_ip, &remote_port, 0);
@@ -673,26 +787,16 @@ static void make_connection_string(struct ChanSess* chansess) {
  * and command-execution requests, and passes the command to
  * noptycommand or ptycommand as appropriate.
  * Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
-static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, int iscmd, int issubsys) {
+int svr_prepare_session_command(struct ChanSess* chansess, buffer* request, int iscmd, int issubsys) {
     unsigned int cmdlen = 0;
-    int ret;
-
-    TRACE(("enter sessioncommand %d", channel->index))
-
-    if (chansess->pid != 0) {
-        /* Note that only one command can _succeed_. The client might try
-         * one command (which fails), then try another. Ie fallback
-         * from sftp to scp */
-        TRACE(("leave sessioncommand, already have a command"))
-        return DROPBEAR_FAILURE;
-    }
+    dropbear_assert(chansess->cmd == NULL && chansess->original_command == NULL);
 
     if (iscmd) {
         /* "exec" */
         if (chansess->cmd == NULL) {
-            chansess->cmd = buf_getstring(ses.payload, &cmdlen);
+            chansess->cmd = buf_getstring(request, &cmdlen);
 
-            if (cmdlen > MAX_CMD_LEN) {
+            if (cmdlen > MAX_CMD_LEN || strlen(chansess->cmd) != cmdlen) {
                 m_free(chansess->cmd);
                 /* TODO - send error - too long ? */
                 TRACE(("leave sessioncommand, command too long %d", cmdlen))
@@ -717,6 +821,11 @@ static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, in
         }
     }
 
+    if (request->pos != request->len) {
+        m_free(chansess->cmd);
+        return DROPBEAR_FAILURE;
+    }
+
     /* take global command into account */
     if (svr_opts.forced_command) {
         if (chansess->cmd) {
@@ -735,6 +844,27 @@ static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, in
         }
     }
 
+    return DROPBEAR_SUCCESS;
+}
+
+static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, int iscmd, int issubsys) {
+    int ret;
+    if (chansess->pid != 0) {
+        return DROPBEAR_FAILURE;
+    }
+#if DROPBEAR_SVR_KEX_BROKER
+    (void)iscmd;
+    (void)issubsys;
+    ret = svr_kex_broker_prepare_command(channel, chansess);
+#else
+    m_free(chansess->original_command);
+    chansess->cmd_is_sftp_subsystem = 0;
+    ret = svr_prepare_session_command(chansess, ses.payload, iscmd, issubsys);
+#endif
+    if (ret != DROPBEAR_SUCCESS) {
+        return ret;
+    }
+
 #if LOG_COMMANDS
     if (chansess->cmd) {
         dropbear_log(LOG_INFO, "User %s executing '%s'", ses.authstate.pw_name, chansess->cmd);
@@ -746,7 +876,7 @@ static int sessioncommand(struct Channel* channel, struct ChanSess* chansess, in
     /* uClinux will vfork(), so there'll be a race as
     connection_string is freed below. */
 #if !DROPBEAR_VFORK
-    make_connection_string(chansess);
+    svr_make_connection_string(chansess);
 #endif
 
     if (chansess->term == NULL) {
@@ -780,7 +910,10 @@ static int noptycommand(struct Channel* channel, struct ChanSess* chansess) {
     int ret;
 
     TRACE(("enter noptycommand"))
-    ret = spawn_command(execchild, chansess, &channel->writefd, &channel->readfd, &channel->errfd, &chansess->pid);
+#if DROPBEAR_SVR_KEX_BROKER
+    return svr_kex_broker_spawn(channel, chansess);
+#endif
+    ret = spawn_command(svr_exec_session_child, chansess, &channel->writefd, &channel->readfd, &channel->errfd, &chansess->pid);
 
     if (ret == DROPBEAR_FAILURE) {
         return ret;
@@ -816,8 +949,7 @@ static int noptycommand(struct Channel* channel, struct ChanSess* chansess) {
 /* Execute a command or shell within a pty environment, and set up
  * redirection as appropriate.
  * Returns DROPBEAR_SUCCESS or DROPBEAR_FAILURE */
-static int ptycommand(struct Channel* channel, struct ChanSess* chansess) {
-    pid_t pid;
+void svr_exec_pty_child(struct ChanSess* chansess) {
     struct logininfo* li = NULL;
 #if DO_MOTD
     buffer* motdbuf = NULL;
@@ -825,6 +957,92 @@ static int ptycommand(struct Channel* channel, struct ChanSess* chansess) {
     struct stat sb;
     char* hushpath = NULL;
 #endif
+    /* child */
+
+    TRACE(("back to normal sigchld"))
+    /* Revert to normal sigchld handling */
+    if (signal(SIGCHLD, SIG_DFL) == SIG_ERR) {
+        dropbear_exit("signal() error");
+    }
+
+    /* redirect stdin/stdout/stderr */
+    if (chansess->master >= 0) close(chansess->master);
+    chansess->master = -1;
+    chansess->pid = getpid();
+
+    pty_make_controlling_tty(&chansess->slave, chansess->tty);
+
+    if ((dup2(chansess->slave, STDIN_FILENO) < 0) || (dup2(chansess->slave, STDOUT_FILENO) < 0)) {
+        TRACE(("leave ptycommand: error redirecting filedesc"))
+        _exit(127);
+    }
+
+    /* write the utmp/wtmp login record - must be after changing the
+     * terminal used for stdout with the dup2 above, otherwise
+     * the wtmp login will not be recorded */
+    li = chansess_login_alloc(chansess);
+
+    svr_raise_gid_utmp();
+    login_login(li);
+    svr_restore_gid();
+
+    login_free_entry(li);
+
+    /* Can now dup2 stderr. Messages from login_login() have gone
+    to the parent stderr */
+    if (dup2(chansess->slave, STDERR_FILENO) < 0) {
+        TRACE(("leave ptycommand: error redirecting filedesc"))
+        _exit(127);
+    }
+
+    if (chansess->slave > STDERR_FILENO) close(chansess->slave);
+    chansess->slave = -1;
+
+#if DO_MOTD
+    if (svr_opts.domotd && !chansess->cmd) {
+        /* don't show the motd if ~/.hushlogin exists */
+
+        /* 12 == strlen("/.hushlogin\0") */
+        len = strlen(ses.authstate.pw_dir) + 12;
+
+        hushpath = m_malloc(len);
+        snprintf(hushpath, len, "%s/.hushlogin", ses.authstate.pw_dir);
+
+        if (stat(hushpath, &sb) < 0) {
+            char* expand_path = NULL;
+            /* more than a screenful is stupid IMHO */
+            motdbuf = buf_new(MOTD_MAXSIZE);
+            expand_path = expand_homedir_path(MOTD_FILENAME);
+            if (buf_readfile(motdbuf, expand_path) == DROPBEAR_SUCCESS) {
+                /* incase it is full size, add LF at last position */
+                if (motdbuf->len == motdbuf->size) motdbuf->data[motdbuf->len - 1] = 10;
+                buf_setpos(motdbuf, 0);
+                while (motdbuf->pos != motdbuf->len) {
+                    len = motdbuf->len - motdbuf->pos;
+                    len = write(STDOUT_FILENO, buf_getptr(motdbuf, len), len);
+                    if (len < 0 && errno == EINTR) continue;
+                    if (len <= 0) break;
+                    buf_incrpos(motdbuf, len);
+                }
+            }
+            m_free(expand_path);
+            buf_free(motdbuf);
+        }
+        m_free(hushpath);
+    }
+#endif /* DO_MOTD */
+
+    svr_exec_session_child(chansess);
+    /* not reached */
+
+}
+
+static int ptycommand(struct Channel* channel, struct ChanSess* chansess) {
+#if DROPBEAR_SVR_KEX_BROKER
+    return svr_kex_broker_spawn(channel, chansess);
+#else
+    pid_t pid;
+
 
     TRACE(("enter ptycommand"))
 
@@ -842,78 +1060,8 @@ static int ptycommand(struct Channel* channel, struct ChanSess* chansess) {
     if (pid < 0) return DROPBEAR_FAILURE;
 
     if (pid == 0) {
-        /* child */
-
-        TRACE(("back to normal sigchld"))
-        /* Revert to normal sigchld handling */
-        if (signal(SIGCHLD, SIG_DFL) == SIG_ERR) {
-            dropbear_exit("signal() error");
-        }
-
-        /* redirect stdin/stdout/stderr */
-        close(chansess->master);
-
-        pty_make_controlling_tty(&chansess->slave, chansess->tty);
-
-        if ((dup2(chansess->slave, STDIN_FILENO) < 0) || (dup2(chansess->slave, STDOUT_FILENO) < 0)) {
-            TRACE(("leave ptycommand: error redirecting filedesc"))
-            return DROPBEAR_FAILURE;
-        }
-
-        /* write the utmp/wtmp login record - must be after changing the
-         * terminal used for stdout with the dup2 above, otherwise
-         * the wtmp login will not be recorded */
-        li = chansess_login_alloc(chansess);
-
-        svr_raise_gid_utmp();
-        login_login(li);
-        svr_restore_gid();
-
-        login_free_entry(li);
-
-        /* Can now dup2 stderr. Messages from login_login() have gone
-        to the parent stderr */
-        if (dup2(chansess->slave, STDERR_FILENO) < 0) {
-            TRACE(("leave ptycommand: error redirecting filedesc"))
-            return DROPBEAR_FAILURE;
-        }
-
-        close(chansess->slave);
-
-#if DO_MOTD
-        if (svr_opts.domotd && !chansess->cmd) {
-            /* don't show the motd if ~/.hushlogin exists */
-
-            /* 12 == strlen("/.hushlogin\0") */
-            len = strlen(ses.authstate.pw_dir) + 12;
-
-            hushpath = m_malloc(len);
-            snprintf(hushpath, len, "%s/.hushlogin", ses.authstate.pw_dir);
-
-            if (stat(hushpath, &sb) < 0) {
-                char* expand_path = NULL;
-                /* more than a screenful is stupid IMHO */
-                motdbuf = buf_new(MOTD_MAXSIZE);
-                expand_path = expand_homedir_path(MOTD_FILENAME);
-                if (buf_readfile(motdbuf, expand_path) == DROPBEAR_SUCCESS) {
-                    /* incase it is full size, add LF at last position */
-                    if (motdbuf->len == motdbuf->size) motdbuf->data[motdbuf->len - 1] = 10;
-                    buf_setpos(motdbuf, 0);
-                    while (motdbuf->pos != motdbuf->len) {
-                        len = motdbuf->len - motdbuf->pos;
-                        len = write(STDOUT_FILENO, buf_getptr(motdbuf, len), len);
-                        buf_incrpos(motdbuf, len);
-                    }
-                }
-                m_free(expand_path);
-                buf_free(motdbuf);
-            }
-            m_free(hushpath);
-        }
-#endif /* DO_MOTD */
-
-        execchild(chansess);
-        /* not reached */
+        svr_exec_pty_child(chansess);
+        _exit(127);
 
     } else {
         /* parent */
@@ -935,6 +1083,7 @@ static int ptycommand(struct Channel* channel, struct ChanSess* chansess) {
 
     TRACE(("leave ptycommand"))
     return DROPBEAR_SUCCESS;
+#endif
 }
 
 /* Add the pid of a child to the list for exit-handling */
@@ -959,7 +1108,7 @@ static void addchildpid(struct ChanSess* chansess, pid_t pid) {
 
 /* Clean up, drop to user privileges, set up the environment and execute
  * the command/shell. This function does not return. */
-static void execchild(const void* user_data) {
+void svr_exec_session_child(const void* user_data) {
     const struct ChanSess* chansess = user_data;
     char* usershell = NULL;
     char* cp = NULL;
@@ -997,6 +1146,9 @@ static void execchild(const void* user_data) {
 
 #if !DROPBEAR_SVR_DROP_PRIVS
     svr_switch_user();
+#else
+    /* Broker children inherit the broker's authority, never the worker drop. */
+    if (svr_kex_broker_is_monitor()) svr_switch_user();
 #endif
 
     /* set env vars */
@@ -1053,6 +1205,11 @@ static void execchild(const void* user_data) {
 #endif
 #if DROPBEAR_SVR_AGENTFWD
     /* set up agent env variable */
+#if DROPBEAR_SVR_KEX_BROKER
+    if (svr_kex_broker_is_monitor()) {
+        if (chansess->broker_agent_path) addnewvar("SSH_AUTH_SOCK", chansess->broker_agent_path);
+    } else
+#endif
     svr_agentset(chansess);
 #endif
 
@@ -1068,7 +1225,9 @@ static void execchild(const void* user_data) {
         run_shell_command(chansess->cmd, ses.maxfd, usershell);
     }
 
-    /* only reached on error */
+    /* The child closed inherited logging FDs before broker-side setup. Keep
+     * exec failures visible on its own stderr without exporting environment. */
+    fprintf(stderr, "Session exec failed: %s\n", strerror(errno));
     dropbear_exit("Child failed");
 }
 

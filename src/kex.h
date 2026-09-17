@@ -75,6 +75,7 @@ int is_compress_recv(void);
 #endif
 
 void recv_msg_kexdh_init(void); /* server */
+void svr_compute_kex_reply(mp_int *dh_e, buffer *q_c); /* broker/local crypto only */
 
 void send_msg_kexdh_init(void); /* client */
 void recv_msg_kexdh_reply(void); /* client */

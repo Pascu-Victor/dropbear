@@ -36,6 +36,7 @@
 #include "runopts.h"
 #include "ecc.h"
 #include "gensignkey.h"
+#include "svr-kex-broker.h"
 
 static void send_msg_kexdh_reply(mp_int *dh_e, buffer *q_c);
 #if DROPBEAR_EXT_INFO
@@ -204,17 +205,28 @@ static void send_msg_kexdh_reply(mp_int *dh_e, buffer *q_c) {
 	/* we can start creating the kexdh_reply packet */
 	CHECKCLEARTOWRITE();
 
-#if DROPBEAR_DELAY_HOSTKEY
-	if (svr_opts.delay_hostkey)
-	{
-		svr_ensure_hostkey();
-	}
-#endif
-
 #if DROPBEAR_FUZZ
 	if (fuzz.fuzzing && fuzz.skip_kexmaths) {
 		fuzz_fake_send_kexdh_reply();
 		return;
+	}
+#endif
+
+#if DROPBEAR_SVR_KEX_BROKER
+	svr_kex_broker_exchange(dh_e, q_c);
+#else
+	svr_compute_kex_reply(dh_e, q_c);
+#endif
+	encrypt_packet();
+	TRACE(("leave send_msg_kexdh_reply"))
+}
+
+/* Generate a fresh server exchange and signed reply without touching the
+ * network. In broker mode only the broker calls this entrypoint. */
+void svr_compute_kex_reply(mp_int *dh_e, buffer *q_c) {
+#if DROPBEAR_DELAY_HOSTKEY
+	if (svr_opts.delay_hostkey) {
+		svr_ensure_hostkey();
 	}
 #endif
 
@@ -274,10 +286,6 @@ static void send_msg_kexdh_reply(mp_int *dh_e, buffer *q_c) {
 	buf_put_sign(ses.writepayload, svr_opts.hostkey, 
 			ses.newkeys->algo_signature, ses.hash);
 
-	/* the SSH_MSG_KEXDH_REPLY is done */
-	encrypt_packet();
-
-	TRACE(("leave send_msg_kexdh_reply"))
 }
 
 #if DROPBEAR_EXT_INFO

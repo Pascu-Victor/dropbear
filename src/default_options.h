@@ -320,6 +320,16 @@ group1 in Dropbear server too */
  */
 #define MAX_PUBKEY_QUERIES 15
 
+/* Connection-local KEX broker; enabled by the WOS build profile. */
+#ifndef DROPBEAR_SVR_KEX_BROKER
+#define DROPBEAR_SVR_KEX_BROKER 0
+#endif
+
+/* Dedicated no-login identity for the WOS broker's network worker. */
+#ifndef DROPBEAR_SVR_BROKER_USER
+#define DROPBEAR_SVR_BROKER_USER "sshd"
+#endif
+
 /* Change server process to user privileges after authentication. */
 #ifndef DROPBEAR_SVR_DROP_PRIVS
 /* Default is enabled. Should only be disabled if platforms are incompatible */
