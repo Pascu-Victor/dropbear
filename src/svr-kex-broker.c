@@ -29,7 +29,9 @@
 #define BROKER_SIGNAL 7
 #define BROKER_PTY 8
 #define BROKER_WINDOW_CHANGE 9
+#define BROKER_REARM 10
 #define BROKER_IO_MAX 16384
+#define BROKER_OUTPUT_CLOSED UINT_MAX
 #define BROKER_PERMITOPEN_MAX 1024
 
 #if DROPBEAR_SVR_PAM_AUTH
@@ -42,6 +44,11 @@
 
 static int request_fd = -1;
 static int response_fd = -1;
+/* Readiness hints never share the synchronous RPC response stream. */
+static int notification_fd = -1;
+static int broker_signal_pipe[2] = {-1, -1};
+static int notification_pending;
+static int notification_sent;
 static pid_t broker_pid = -1;
 static int monitor_process;
 static unsigned int relay_count;
@@ -53,6 +60,8 @@ struct PreparedSession {
 	struct ChanSess command;
 	int command_ready;
 	int fd[3]; /* broker-owned stdin writer, stdout reader, stderr reader */
+	int watch[3]; /* input capacity / advertised output capacity */
+	int exit_reported;
 };
 static struct PreparedSession *prepared_sessions[MAX_CHANNELS];
 static unsigned int next_session_id;
@@ -66,6 +75,7 @@ struct BrokerRelay {
 	int eof[3];
 	struct RelayChunk chunk[3];
 	struct exitinfo exit;
+	int pending;
 };
 
 static void close_stream(int *fd) {
@@ -501,6 +511,87 @@ static void reap_sessions(void) {
 	}
 }
 
+/* The byte survives event-before-select, including a child exiting between
+ * waitpid and select. No allocator, logger, or session state runs in a handler. */
+static void broker_child_signal(int UNUSED(signum)) {
+	int saved_errno = errno;
+	char byte = 'C';
+	while (write(broker_signal_pipe[1], &byte, 1) < 0 && errno == EINTR) {}
+	errno = saved_errno;
+}
+
+/* One outstanding hint covers all sessions. Until the worker services them
+ * and rearms, suppress level-ready child FDs rather than repeatedly waking.
+ * A full hint pipe retains pending state and waits for writable notification.
+ * Requests and SIGCHLD remain monitored even when output is backpressured. */
+static void broker_wait_for_request(int input) {
+	for (;;) {
+		fd_set readfds, writefds;
+		unsigned int slot, stream;
+		int result;
+		char byte = 'R';
+		reap_sessions();
+		FD_ZERO(&readfds);
+		FD_ZERO(&writefds);
+		FD_SET(input, &readfds);
+		FD_SET(broker_signal_pipe[0], &readfds);
+		if (!notification_sent && !notification_pending) {
+			for (slot = 0; slot < MAX_CHANNELS; slot++) {
+				struct PreparedSession *entry = prepared_sessions[slot];
+				if (!entry || !entry->command.pid) continue;
+				if (entry->command.exit.exitpid != -1 && !entry->exit_reported)
+					notification_pending = 1;
+				for (stream = 0; stream < 3; stream++) {
+					if (entry->fd[stream] >= 0 && entry->watch[stream])
+						FD_SET(entry->fd[stream], stream == 0 ? &writefds : &readfds);
+				}
+			}
+		}
+		if (notification_pending) {
+			ssize_t count;
+			do { count = write(notification_fd, &byte, 1); } while (count < 0 && errno == EINTR);
+			if (count == 1) {
+				notification_pending = 0;
+				notification_sent = 1;
+			} else if (count < 0 && errno == EAGAIN) {
+				FD_SET(notification_fd, &writefds);
+			} else {
+				dropbear_exit("Session broker notification failed");
+			}
+			/* The hint owns these level events until rearm. */
+			FD_ZERO(&readfds);
+			FD_ZERO(&writefds);
+			FD_SET(input, &readfds);
+			FD_SET(broker_signal_pipe[0], &readfds);
+			if (notification_pending) FD_SET(notification_fd, &writefds);
+		}
+		result = select(ses.maxfd + 1, &readfds, &writefds, NULL, NULL);
+		if (result < 0) {
+			if (errno == EINTR) continue;
+			dropbear_exit("Session broker select failed");
+		}
+		if (FD_ISSET(broker_signal_pipe[0], &readfds)) {
+			char bytes[64];
+			ssize_t count;
+			do { count = read(broker_signal_pipe[0], bytes, sizeof(bytes)); }
+			while (count > 0 || (count < 0 && errno == EINTR));
+			reap_sessions();
+		}
+		if (!notification_sent && !notification_pending) {
+			for (slot = 0; slot < MAX_CHANNELS; slot++) {
+				struct PreparedSession *entry = prepared_sessions[slot];
+				if (!entry || !entry->command.pid) continue;
+				for (stream = 0; stream < 3; stream++) {
+					if (entry->fd[stream] >= 0 && entry->watch[stream]
+							&& FD_ISSET(entry->fd[stream], stream == 0 ? &writefds : &readfds))
+						notification_pending = 1;
+				}
+			}
+		}
+		if (FD_ISSET(input, &readfds)) return;
+	}
+}
+
 static buffer *spawn_session_request(buffer *frame) {
 	struct PreparedSession *entry = read_session(frame);
 	char *agent_path = read_optional_string(frame);
@@ -550,6 +641,7 @@ static buffer *spawn_session_request(buffer *frame) {
 	dropbear_log(LOG_INFO, "Broker session spawned id=%u pid=%ld", entry->id, (long)pid);
 	entry->command.pid = pid;
 	entry->command.exit.exitpid = -1;
+	entry->watch[1] = entry->watch[2] = 1;
 	if (is_pty) {
 		close_stream(&entry->command.slave);
 		entry->fd[0] = entry->fd[1] = entry->command.master;
@@ -582,7 +674,8 @@ static buffer *session_io_request(buffer *frame) {
 	capacity[0] = buf_getint(frame);
 	capacity[1] = buf_getint(frame);
 	if (!entry->command.pid || frame->pos != frame->len || input->len > BROKER_IO_MAX
-			|| capacity[0] > BROKER_IO_MAX || capacity[1] > BROKER_IO_MAX) {
+			|| (capacity[0] > BROKER_IO_MAX && capacity[0] != BROKER_OUTPUT_CLOSED)
+			|| (capacity[1] > BROKER_IO_MAX && capacity[1] != BROKER_OUTPUT_CLOSED)) {
 		dropbear_exit("Session broker IO envelope invalid");
 	}
 	if (entry->fd[0] >= 0 && input->len) {
@@ -594,6 +687,7 @@ static buffer *session_io_request(buffer *frame) {
 		}
 	}
 	if (input_eof && consumed == input->len) close_session_stream(entry, 0);
+	entry->watch[0] = entry->fd[0] >= 0 && consumed < input->len;
 	buf_putint(reply, consumed);
 	buf_putbyte(reply, entry->fd[0] < 0);
 	buf_burn_free(input);
@@ -601,6 +695,9 @@ static buffer *session_io_request(buffer *frame) {
 		unsigned char data[BROKER_IO_MAX];
 		ssize_t n = 0;
 		int *fd = &entry->fd[i+1];
+		/* Adapter failure revokes this stream, so the child sees a broken pipe
+		 * rather than blocking forever behind permanently zero capacity. */
+		if (capacity[i] == BROKER_OUTPUT_CLOSED) close_session_stream(entry, i+1);
 		if (*fd >= 0 && capacity[i]) {
 			n = read(*fd, data, capacity[i]);
 			if (n < 0 && errno != EINTR && errno != EAGAIN)
@@ -610,8 +707,11 @@ static buffer *session_io_request(buffer *frame) {
 		}
 		buf_putstring(reply, (const char *)data, n > 0 ? n : 0);
 		buf_putbyte(reply, *fd < 0);
+		/* Returned bytes occupy a worker chunk until its adapter drains. */
+		entry->watch[i+1] = *fd >= 0 && capacity[i] && n <= 0;
 	}
 	put_exit(reply, &entry->command.exit);
+	entry->exit_reported = entry->command.exit.exitpid != -1;
 	return reply;
 }
 
@@ -756,12 +856,14 @@ static void retain_public_hostkeys(void) {
 	svr_opts.hostkey = public_keys;
 }
 
-static void broker_loop(int input, int output) {
+static void broker_loop(int input, int output, int notify) {
 	buffer *frame;
+	struct sigaction child_action;
 	enum signature_type first_signature = DROPBEAR_SIGNATURE_NONE;
 	monitor_process = 1;
 	request_fd = input;
 	response_fd = output;
+	notification_fd = notify;
 	svr_make_connection_string(&connection_environment);
 	/* No network, listener slot, or worker signal pipe remains in the broker. */
 	signal(SIGCHLD, SIG_DFL);
@@ -778,6 +880,20 @@ static void broker_loop(int input, int output) {
 	close(ses.signal_pipe[1]);
 	close(svr_ses.childpipe);
 	svr_ses.childpipe = -1;
+	if (pipe(broker_signal_pipe) < 0) dropbear_exit("Session broker signal pipe failed");
+	for (unsigned int i = 0; i < 2; i++) {
+		if (broker_signal_pipe[i] >= FD_SETSIZE
+				|| fcntl(broker_signal_pipe[i], F_SETFD, FD_CLOEXEC) < 0)
+			dropbear_exit("Session broker signal descriptor invalid");
+		setnonblocking(broker_signal_pipe[i]);
+		ses.maxfd = MAX(ses.maxfd, broker_signal_pipe[i]);
+	}
+	memset(&child_action, 0, sizeof(child_action));
+	child_action.sa_handler = broker_child_signal;
+	child_action.sa_flags = SA_NOCLDSTOP;
+	sigemptyset(&child_action.sa_mask);
+	if (sigaction(SIGCHLD, &child_action, NULL) < 0)
+		dropbear_exit("Session broker child notification failed");
 	if (ses.kexhashbuf) buf_burn_free(ses.kexhashbuf);
 	ses.kexhashbuf = NULL;
 	/* The network worker sends the configured banner before forwarding auth. */
@@ -787,13 +903,27 @@ static void broker_loop(int input, int output) {
 	}
 	seedrandom();
 
-	while ((frame = read_frame(input, 1)) != NULL) {
+	for (;;) {
+		broker_wait_for_request(input);
+		frame = read_frame(input, 1);
+		if (!frame) break;
 		DEF_MP_INT(dh_e);
 		buffer *q_c = NULL;
 		buffer *secret, *reply;
 		algo_type *kex, *sig;
 		unsigned char operation = buf_getbyte(frame);
 		reap_sessions();
+		if (operation == BROKER_REARM) {
+			if (!ses.authstate.authdone || frame->pos != frame->len || !notification_sent)
+				dropbear_exit("Session broker rearm invalid");
+			notification_sent = notification_pending = 0;
+			reply = buf_new(1);
+			buf_putbyte(reply, 1);
+			buf_burn_free(frame);
+			write_frame(output, reply);
+			buf_free(reply);
+			continue;
+		}
 		if (operation >= BROKER_AUTH_REQUEST && operation <= BROKER_WINDOW_CHANGE) {
 			if (operation == BROKER_AUTH_REQUEST) reply = authenticate_request(frame);
 			else if (operation == BROKER_PREPARE_COMMAND) reply = prepare_command_request(frame);
@@ -872,6 +1002,9 @@ static void broker_loop(int input, int output) {
 	sign_key_free(svr_opts.hostkey);
 	close(input);
 	close(output);
+	close(notification_fd);
+	close(broker_signal_pipe[0]);
+	close(broker_signal_pipe[1]);
 	_exit(0);
 }
 
@@ -910,7 +1043,7 @@ static void drop_network_worker(uid_t uid, gid_t gid) {
 }
 
 void svr_kex_broker_start(void) {
-	int request[2], response[2];
+	int request[2], response[2], notify[2];
 	pid_t pid;
 	uid_t worker_uid;
 	gid_t worker_gid;
@@ -927,17 +1060,22 @@ void svr_kex_broker_start(void) {
 		close(request[1]);
 		dropbear_exit("KEX broker creation failed");
 	}
+	if (pipe(notify) < 0) dropbear_exit("Session broker notification pipe failed");
 	for (unsigned int i = 0; i < 2; i++) {
-		if (request[i] >= FD_SETSIZE || response[i] >= FD_SETSIZE)
+		if (request[i] >= FD_SETSIZE || response[i] >= FD_SETSIZE || notify[i] >= FD_SETSIZE)
 			dropbear_exit("KEX broker descriptor exceeds session bound");
-		ses.maxfd = MAX(ses.maxfd, MAX(request[i], response[i]));
+		ses.maxfd = MAX(ses.maxfd, MAX(notify[i], MAX(request[i], response[i])));
 	}
 	if (fcntl(request[1], F_SETFD, FD_CLOEXEC) < 0
 			|| fcntl(request[0], F_SETFD, FD_CLOEXEC) < 0
 			|| fcntl(response[1], F_SETFD, FD_CLOEXEC) < 0
-			|| fcntl(response[0], F_SETFD, FD_CLOEXEC) < 0) {
+			|| fcntl(response[0], F_SETFD, FD_CLOEXEC) < 0
+			|| fcntl(notify[0], F_SETFD, FD_CLOEXEC) < 0
+			|| fcntl(notify[1], F_SETFD, FD_CLOEXEC) < 0) {
 		dropbear_exit("KEX broker descriptor setup failed");
 	}
+	setnonblocking(notify[0]);
+	setnonblocking(notify[1]);
 	pid = fork();
 	if (pid < 0) {
 		dropbear_exit("KEX broker fork failed");
@@ -945,15 +1083,18 @@ void svr_kex_broker_start(void) {
 	if (pid == 0) {
 		close(request[1]);
 		close(response[0]);
+		close(notify[0]);
 		/* Establish the broker boundary before the parent discards authority. */
 		char ready = 'S';
 		if (setsid() < 0 || atomicio(vwrite, response[1], &ready, 1) != 1) _exit(127);
-		broker_loop(request[0], response[1]);
+		broker_loop(request[0], response[1], notify[1]);
 	}
 	close(request[0]);
 	close(response[1]);
+	close(notify[1]);
 	request_fd = request[1];
 	response_fd = response[0];
+	notification_fd = notify[0];
 	broker_pid = pid;
 	char ready = 0;
 	if (atomicio(read, response_fd, &ready, 1) != 1 || ready != 'S'
@@ -1206,6 +1347,7 @@ int svr_kex_broker_spawn(struct Channel *channel, struct ChanSess *session) {
 	/* A running marker, not a PID. Signal/status operations use private ID. */
 	session->pid = 1;
 	session->broker_relay = relay;
+	relay->pending = 1;
 	relay_count++;
 	return DROPBEAR_SUCCESS;
 }
@@ -1224,19 +1366,52 @@ int svr_kex_broker_signal(const struct ChanSess *session) {
 	return accepted ? DROPBEAR_SUCCESS : DROPBEAR_FAILURE;
 }
 
-void svr_kex_broker_timeout(struct timeval *timeout) {
-	if (relay_count && (timeout->tv_sec > 0 || timeout->tv_usec > 10000)) {
-		timeout->tv_sec = 0;
-		timeout->tv_usec = 10000;
+void svr_kex_broker_setfds(fd_set *readfds, fd_set *writefds) {
+	unsigned int index, stream;
+	if (notification_fd >= 0) FD_SET(notification_fd, readfds);
+	if (!relay_count) return;
+	for (index = 0; index < ses.chansize; index++) {
+		struct Channel *channel = ses.channels[index];
+		struct BrokerRelay *relay;
+		if (!channel || channel->type != &svrchansess) continue;
+		relay = ((struct ChanSess *)channel->typedata)->broker_relay;
+		if (!relay) continue;
+		if (relay->fd[0] >= 0 && relay->chunk[0].len == 0) FD_SET(relay->fd[0], readfds);
+		for (stream = 1; stream < 3; stream++) {
+			if (relay->fd[stream] >= 0 && relay->chunk[stream].len)
+				FD_SET(relay->fd[stream], writefds);
+		}
 	}
+}
+
+static void drain_relay_output(struct BrokerRelay *relay, unsigned int stream) {
+	struct RelayChunk *chunk = &relay->chunk[stream];
+	if (relay->fd[stream] >= 0 && chunk->len) {
+		ssize_t n = write(relay->fd[stream], chunk->data + chunk->pos, chunk->len - chunk->pos);
+		if (n > 0) chunk->pos += n;
+		else if (n < 0 && errno != EINTR && errno != EAGAIN) close_stream(&relay->fd[stream]);
+		if (chunk->pos == chunk->len || relay->fd[stream] < 0) {
+			chunk->pos = chunk->len = 0;
+			relay->pending = 1;
+		}
+	}
+	if (relay->eof[stream] && chunk->len == 0) close_stream(&relay->fd[stream]);
 }
 
 /* A slow child gets no more input until it consumes the retained chunk; a slow
  * SSH receiver advertises no output capacity until its adapter drains. Every
  * FD operation is nonblocking and each RPC has a bounded request and response. */
-void svr_kex_broker_io(void) {
+void svr_kex_broker_io(fd_set *readfds, fd_set *writefds) {
 	unsigned int index, i;
-	if (!relay_count) return;
+	int notified = 0;
+	if (readfds && notification_fd >= 0 && FD_ISSET(notification_fd, readfds)) {
+		char byte;
+		ssize_t count;
+		do { count = read(notification_fd, &byte, 1); } while (count < 0 && errno == EINTR);
+		if (count == 1 && byte == 'R') notified = 1;
+		else if (count == 0 || (count < 0 && errno != EAGAIN) || count > 0)
+			dropbear_exit("Session broker notification closed");
+	}
 	for (index = 0; index < ses.chansize; index++) {
 		struct Channel *channel = ses.channels[index];
 		struct ChanSess *session;
@@ -1249,22 +1424,34 @@ void svr_kex_broker_io(void) {
 		session = channel->typedata;
 		relay = session->broker_relay;
 		if (!relay) continue;
+		if (notified) relay->pending = 1;
 		input = &relay->chunk[0];
-		if (relay->fd[0] >= 0 && input->len == 0) {
+		if (readfds && relay->fd[0] >= 0 && input->len == 0 && FD_ISSET(relay->fd[0], readfds)) {
 			ssize_t n = read(relay->fd[0], input->data, BROKER_IO_MAX);
-			if (n > 0) input->len = n;
-			else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
+			if (n > 0) { input->len = n; relay->pending = 1; }
+			else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
 				relay->eof[0] = 1;
 				close_stream(&relay->fd[0]);
+				relay->pending = 1;
 			}
 		}
+		for (i = 1; i < 3; i++) {
+			struct RelayChunk *chunk = &relay->chunk[i];
+			if (writefds && relay->fd[i] >= 0 && chunk->len && FD_ISSET(relay->fd[i], writefds)) {
+				drain_relay_output(relay, i);
+			}
+			if (relay->eof[i] && chunk->len == 0) close_stream(&relay->fd[i]);
+		}
+		if (!relay->pending) continue;
+		relay->pending = 0;
 		request = buf_new(BROKER_IO_MAX + 32);
 		buf_putbyte(request, BROKER_IO);
 		buf_putint(request, session->broker_session_id);
 		buf_putstring(request, (const char *)input->data + input->pos, input->len - input->pos);
 		buf_putbyte(request, relay->eof[0]);
 		for (i = 1; i < 3; i++) {
-			buf_putint(request, relay->chunk[i].len == 0 ? BROKER_IO_MAX : 0);
+			buf_putint(request, relay->fd[i] < 0 ? BROKER_OUTPUT_CLOSED
+				: relay->chunk[i].len == 0 ? BROKER_IO_MAX : 0);
 		}
 		reply = session_rpc(request);
 		consumed = buf_getint(reply);
@@ -1299,14 +1486,10 @@ void svr_kex_broker_io(void) {
 		if (reply->pos != reply->len) dropbear_exit("Session broker IO reply has trailing bytes");
 		buf_burn_free(reply);
 		for (i = 1; i < 3; i++) {
-			struct RelayChunk *chunk = &relay->chunk[i];
-			if (relay->fd[i] >= 0 && chunk->len) {
-				ssize_t n = write(relay->fd[i], chunk->data + chunk->pos, chunk->len - chunk->pos);
-				if (n > 0) chunk->pos += n;
-				else if (n < 0 && errno != EINTR && errno != EAGAIN) close_stream(&relay->fd[i]);
-			}
-			if (chunk->pos == chunk->len || relay->fd[i] < 0) chunk->pos = chunk->len = 0;
-			if (relay->eof[i] && chunk->len == 0) close_stream(&relay->fd[i]);
+			/* New bytes are useful work now, even if this select snapshot did
+			 * not watch a previously empty adapter. A blocked or partial write
+			 * stays bounded in the chunk and waits for adapter readiness. */
+			drain_relay_output(relay, i);
 		}
 		if (relay->exit.exitpid != -1 && relay->fd[1] < 0 && relay->fd[2] < 0) {
 			/* All output has entered the adapter pipes before common-channel
@@ -1314,6 +1497,14 @@ void svr_kex_broker_io(void) {
 			session->exit = relay->exit;
 			ses.channel_signal_pending = 1;
 		}
+	}
+	if (notified) {
+		buffer *request = buf_new(1), *reply;
+		buf_putbyte(request, BROKER_REARM);
+		reply = session_rpc(request);
+		if (buf_getbyte(reply) != 1 || reply->pos != reply->len)
+			dropbear_exit("Session broker rearm reply invalid");
+		buf_free(reply);
 	}
 }
 
@@ -1336,6 +1527,7 @@ void svr_kex_broker_release_session(struct ChanSess *session) {
 }
 
 void svr_kex_broker_cleanup(void) {
+	close_stream(&notification_fd);
 	if (request_fd >= 0) {
 		close(request_fd);
 		request_fd = -1;

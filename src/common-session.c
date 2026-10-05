@@ -181,7 +181,7 @@ void session_loop(void(*loophandler)(void)) {
 		timeout.tv_sec = select_timeout();
 		timeout.tv_usec = 0;
 #if DROPBEAR_SERVER && DROPBEAR_SVR_KEX_BROKER
-		if (ses.isserver) svr_kex_broker_timeout(&timeout);
+		if (ses.isserver) svr_kex_broker_io(NULL, NULL);
 #endif
 		DROPBEAR_FD_ZERO(&writefd);
 		DROPBEAR_FD_ZERO(&readfd);
@@ -199,6 +199,9 @@ void session_loop(void(*loophandler)(void)) {
 
 		/* set up for channels which can be read/written */
 		setchannelfds(&readfd, &writefd, writequeue_has_space);
+#if DROPBEAR_SERVER && DROPBEAR_SVR_KEX_BROKER
+		if (ses.isserver) svr_kex_broker_setfds(&readfd, &writefd);
+#endif
 
 		/* Pending connections to test */
 		set_connect_fds(&writefd);
@@ -282,7 +285,7 @@ void session_loop(void(*loophandler)(void)) {
 		channels on process exit */
 		loophandler();
 #if DROPBEAR_SERVER && DROPBEAR_SVR_KEX_BROKER
-		if (ses.isserver) svr_kex_broker_io();
+		if (ses.isserver) svr_kex_broker_io(&readfd, &writefd);
 #endif
 
 		/* process pipes etc for the channels, ses.dataallowed == 0

@@ -20,8 +20,8 @@ int svr_kex_broker_spawn(struct Channel *channel, struct ChanSess *session);
 int svr_kex_broker_signal(const struct ChanSess *session);
 int svr_kex_broker_pty(struct Channel *channel, struct ChanSess *session);
 int svr_kex_broker_window_change(struct Channel *channel, struct ChanSess *session);
-void svr_kex_broker_io(void);
-void svr_kex_broker_timeout(struct timeval *timeout);
+void svr_kex_broker_io(fd_set *readfds, fd_set *writefds);
+void svr_kex_broker_setfds(fd_set *readfds, fd_set *writefds);
 #else
 #define svr_kex_broker_cleanup() ((void)0)
 #define svr_kex_broker_checkchild(pid) ((void)(pid))
